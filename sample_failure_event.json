@@ -1,0 +1,10 @@
+[
+  {"step":1,"component_id":"RDBMS_PRIMARY","message":"Connection refused","metadata":{"error_code":"ECONNREFUSED","latency_ms":9999}},
+  {"step":2,"component_id":"RDBMS_REPLICA_01","message":"Replication lag critical","metadata":{"lag_seconds":45}},
+  {"step":3,"component_id":"MCP_HOST_01","message":"Health check failed","metadata":{"response_code":503}},
+  {"step":4,"component_id":"MCP_HOST_02","message":"Health check failed","metadata":{"response_code":503}},
+  {"step":5,"component_id":"API_GATEWAY","message":"5xx error rate 78%","metadata":{"error_rate":0.78}},
+  {"step":6,"component_id":"CACHE_CLUSTER_01","message":"Cache stampede","metadata":{"hit_rate":0.02}},
+  {"step":7,"component_id":"QUEUE_ASYNC_01","message":"Queue depth critical","metadata":{"queue_depth":142000}},
+  {"step":8,"component_id":"NOSQL_MONGO_01","message":"Write concern timeout","metadata":{"timeout_ms":5000}}
+]
