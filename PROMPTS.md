@@ -1,8 +1,5 @@
 # Prompts, Specs & Plans Used
 
-## Tool Used
-Claude (Anthropic) — claude.ai
-
 ## Objective
 Build a production-style Incident Management System with:
 - Async ingestion
