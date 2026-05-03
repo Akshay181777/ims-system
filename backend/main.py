@@ -10,16 +10,25 @@ from typing import Optional
 import asyncpg
 import motor.motor_asyncio
 import redis.asyncio as aioredis
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from pydantic import BaseModel
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 
+# ── Prometheus metrics ───────────────────────────────────────────────────────
+signals_received  = Counter("ims_signals_total", "Total signals ingested", ["component_id"])
+incidents_created = Counter("ims_incidents_total", "Total incidents created", ["severity"])
+request_latency   = Histogram("ims_request_duration_seconds", "Request latency", ["endpoint"])
+
+# ── Config ───────────────────────────────────────────────────────────────────
 PG_HOST    = os.getenv("POSTGRES_HOST", "localhost")
 MONGO_HOST = os.getenv("MONGO_HOST", "localhost")
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
-RATE_LIMIT_MAX = 100
+RATE_LIMIT_MAX    = 100
 RATE_LIMIT_WINDOW = 10
 
+# ── Strategy Pattern — Alert routing ─────────────────────────────────────────
 class AlertStrategy(ABC):
     @abstractmethod
     def alert(self, incident_id: int, component_id: str) -> dict: ...
@@ -53,11 +62,12 @@ def get_severity_label(component_id: str) -> str:
         return "P2"
     return "P1"
 
+# ── State Pattern — Work item lifecycle ──────────────────────────────────────
 VALID_TRANSITIONS: dict[str, list[str]] = {
-    "OPEN": ["INVESTIGATING"],
+    "OPEN":          ["INVESTIGATING"],
     "INVESTIGATING": ["RESOLVED"],
-    "RESOLVED": ["CLOSED"],
-    "CLOSED": [],
+    "RESOLVED":      ["CLOSED"],
+    "CLOSED":        [],
 }
 
 class WorkItemStateMachine:
@@ -73,11 +83,15 @@ class WorkItemStateMachine:
 
     def transition(self, new_status: str) -> str:
         if not self.can_transition(new_status):
-            raise ValueError(f"Invalid transition: {self._status} → {new_status}. Allowed: {VALID_TRANSITIONS.get(self._status, [])}")
+            raise ValueError(
+                f"Invalid transition: {self._status} → {new_status}. "
+                f"Allowed: {VALID_TRANSITIONS.get(self._status, [])}"
+            )
         old = self._status
         self._status = new_status
         return old
 
+# ── Async-safe rate limiter ───────────────────────────────────────────────────
 class AsyncRateLimiter:
     def __init__(self, max_requests: int, window: int):
         self._max = max_requests
@@ -96,6 +110,8 @@ class AsyncRateLimiter:
             return False
 
 rate_limiter = AsyncRateLimiter(RATE_LIMIT_MAX, RATE_LIMIT_WINDOW)
+
+# ── DB connections ────────────────────────────────────────────────────────────
 pg_pool: asyncpg.Pool | None = None
 mongo_client = None
 redis_client = None
@@ -140,42 +156,73 @@ async def lifespan(app: FastAPI):
     mongo_client.close()
     await redis_client.aclose()
 
+# ── App setup ─────────────────────────────────────────────────────────────────
 app = FastAPI(title="IMS API", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ── Option 3: Security headers middleware ─────────────────────────────────────
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"]  = "nosniff"
+    response.headers["X-Frame-Options"]         = "DENY"
+    response.headers["X-XSS-Protection"]        = "1; mode=block"
+    response.headers["Strict-Transport-Security"] = "max-age=31536000"
+    response.headers["Referrer-Policy"]         = "strict-origin-when-cross-origin"
+    return response
+
+# ── Models ────────────────────────────────────────────────────────────────────
 class SignalPayload(BaseModel):
     component_id: str
-    message: Optional[str] = "Failure detected"
+    message:  Optional[str] = "Failure detected"
     metadata: Optional[dict] = {}
 
 class TransitionPayload(BaseModel):
     status: str
 
 class RCAPayload(BaseModel):
-    start_time: str
-    end_time: str
+    start_time:          str
+    end_time:            str
     root_cause_category: str
-    fix_applied: str
-    prevention_steps: str
+    fix_applied:         str
+    prevention_steps:    str
 
     def validate_complete(self):
-        missing = [f for f in ["start_time","end_time","root_cause_category","fix_applied","prevention_steps"]
-                   if not getattr(self, f, "").strip()]
+        missing = [
+            f for f in ["start_time","end_time","root_cause_category","fix_applied","prevention_steps"]
+            if not getattr(self, f, "").strip()
+        ]
         if missing:
             raise ValueError(f"Incomplete RCA. Missing fields: {missing}")
 
+# ── Endpoints ─────────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
     queue_len = await redis_client.llen("signal_queue")
     return {"status": "ok", "queue_depth": queue_len, "timestamp": time.time()}
 
+@app.get("/metrics")
+async def metrics():
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
 @app.post("/signal")
 async def ingest_signal(signal: SignalPayload):
     if await rate_limiter.is_limited():
         raise HTTPException(status_code=429, detail="Rate limit exceeded")
-    payload = {"component_id": signal.component_id, "message": signal.message,
-                "metadata": signal.metadata, "timestamp": time.time()}
+    payload = {
+        "component_id": signal.component_id,
+        "message":      signal.message,
+        "metadata":     signal.metadata,
+        "timestamp":    time.time(),
+    }
     await redis_client.lpush("signal_queue", json.dumps(payload))
+    signals_received.labels(component_id=signal.component_id).inc()
     bucket = int(time.time() // 300) * 300
     async with pg_pool.acquire() as conn:
         await conn.execute("""
@@ -236,11 +283,12 @@ async def submit_rca(incident_id: int, rca: RCAPayload):
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
         end_time = time.time()
-        mttr = end_time - row["start_time"]
+        mttr     = end_time - row["start_time"]
         rca_json = json.dumps(rca.model_dump())
         await conn.execute("""
             UPDATE incidents SET status=$1, end_time=$2, mttr_seconds=$3, rca=$4 WHERE id=$5
         """, "CLOSED", end_time, mttr, rca_json, incident_id)
+    incidents_created.labels(severity="CLOSED").inc()
     await redis_client.delete("dashboard:incidents")
     return {"message": "Incident closed", "mttr_seconds": round(mttr, 2), "mttr_minutes": round(mttr/60, 2)}
 
@@ -254,5 +302,7 @@ async def stats():
         timeseries = await conn.fetch("""
             SELECT bucket, count FROM signal_stats ORDER BY bucket DESC LIMIT 24
         """)
-    return {"by_component": [dict(r) for r in by_component],
-            "timeseries": [dict(r) for r in reversed(timeseries)]}
+    return {
+        "by_component": [dict(r) for r in by_component],
+        "timeseries":   [dict(r) for r in reversed(timeseries)],
+    }

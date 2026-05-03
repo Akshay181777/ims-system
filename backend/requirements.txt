@@ -8,3 +8,4 @@ motor==3.4.0
 sqlalchemy==2.0.30
 aiofiles==23.2.1
 python-multipart==0.0.9
+prometheus-client==0.20.0
